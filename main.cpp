@@ -3,8 +3,8 @@
 //  GTA IV: The Complete Edition (1.2.0.59) with FusionFix
 //
 //  Every controller button (and both triggers) can do what another one does,
-//  with one layout in vehicles and one on foot. Set up in a menu in game
-//  (F8, or LS + RS clicked together), saved in ControllerRebind.ini.
+//  with one layout in vehicles and one on foot. Set up in a menu opened from
+//  the pause menu (Controls > Controller Configuration), saved in ControllerRebind.ini.
 //  Works by changing what the game reads from XInput; the game's own menus
 //  always get the normal layout.
 //
@@ -40,7 +40,7 @@
 // ---------------------------------------------------------------------
 //  Log
 // ---------------------------------------------------------------------
-static const char* const kVersion = "1.0";   // shown at the bottom right of the menu and in the log
+static const char* const kVersion = "1.1";   // written into the log
 
 static std::string g_dir;
 static FILE* g_log = nullptr;
@@ -101,29 +101,21 @@ static int ParseBtn(const char* raw)
 // ---------------------------------------------------------------------
 //  Settings (ControllerRebind.ini)
 // ---------------------------------------------------------------------
-struct Config
-{
-    int  keyMenu = VK_PRIOR;   // opens / closes the menu (Page Up)
-    int  style = 0;         // controller shown in the menu: 0 = Xbox, 1 = PlayStation
-} cfg;
-
 static const char* kIniName = "ControllerRebind.ini";
 
 static const char* kDefaultIni =
 "; Controller Rebind - Settings\r\n"
 "; Free controller button layout for GTA IV: The Complete Edition (requires FusionFix)\r\n"
 ";\r\n"
-"; Easiest: open the menu in game with Page Up and change the buttons there with the mouse.\r\n"
+"; Easiest: in the pause menu choose Controls > Controller Configuration and change the buttons there with the mouse.\r\n"
 ";\r\n"
 "; Buttons: A, B, X, Y, LB, RB, LT, RT, LS, RS, Back, Start, Up, Down, Left, Right (D-pad). Off = does nothing.\r\n"
 "; (A = Cross, B = Circle, X = Square, Y = Triangle, LB = L1, RB = R1, LT = L2, RT = R2, LS = L3, RS = R3,\r\n"
 ";  Back = Share / Select, Start = Options)\r\n"
 "\r\n"
 "[Menu]\r\n"
-"; Key that opens and closes the menu in game (Esc closes it as well)\r\n"
-"Key=PageUp\r\n"
-"; Controller shown in the menu: Xbox or PlayStation (also switched in the menu)\r\n"
-"Style=Xbox\r\n"
+"; The controller picture in the menu follows the game's setting Controls > Gamepad Icons\r\n"
+"; (PlayStation icons: PlayStation picture, all others: Xbox picture)\r\n"
 "; Language of the menu: Auto (the game's language, from FusionFix), English, German, French, Italian or Spanish\r\n"
 "Language=Auto\r\n"
 "\r\n"
@@ -197,12 +189,6 @@ static void LoadConfig()
     }
     const char* p = path.c_str();
     char buf[64];
-    GetPrivateProfileStringA("Menu", "Key", "PageUp", buf, sizeof(buf), p);
-    int vk = ParseKey(buf);
-    if (vk < 0) Log("Unknown menu key '%s' - using Page Up", buf);
-    cfg.keyMenu = vk <= 0 ? VK_PRIOR : vk;
-    GetPrivateProfileStringA("Menu", "Style", "Xbox", buf, sizeof(buf), p);
-    cfg.style = (_strnicmp(buf, "PlayStation", 4) == 0 || _strnicmp(buf, "PS", 2) == 0) ? 1 : 0;
     for (int pr = 0; pr < 2; pr++)
         for (int i = 0; i < kNumBtn; i++)
         {
@@ -224,7 +210,7 @@ static void LoadConfig()
     for (int pr = 0; pr < 2; pr++) for (int i = 0; i < kNumBtn; i++) if (g_keyBind[pr][i]) keys++;
     int changed = 0;
     for (int pr = 0; pr < 2; pr++) for (int i = 0; i < kNumBtn; i++) if (g_map[pr][i] != i) changed++;
-    Log("Menu key 0x%X | %d buttons changed, %d press a keyboard key", cfg.keyMenu, changed, keys);
+    Log("%d buttons changed, %d press a keyboard key", changed, keys);
 }
 
 static void SaveMaps()
@@ -323,6 +309,72 @@ static bool* g_scriptPause = nullptr;
 static bool* g_menuActive = nullptr;
 static IDirect3DDevice9** g_ppDevice = nullptr;
 
+// Pause menu pages (found the way FusionFix finds them): the page shown now, and the table of all pages (24 bytes each:
+// header text [16], options pointer, option count). An option is 22 bytes: action, label [16] (text key), ...
+static volatile int32_t* g_feScreen = nullptr;
+static const uint8_t* g_feScreens = nullptr;
+static const int kFeScreens = 73;
+
+static bool ScreenOptions(int s, const uint8_t** data, int* count)
+{
+    if (!g_feScreens || s < 0 || s >= kFeScreens) return false;
+    const uint8_t* e = g_feScreens + s * 24;
+    *data = *(const uint8_t* const*)(e + 0x10);
+    *count = *(const uint16_t*)(e + 0x14);
+    return *count == 0 || (*data && IsReadable(*data, *count * 22));
+}
+
+static bool ScreenHasLabel(int s, const char* label)
+{
+    const uint8_t* d; int n;
+    if (!ScreenOptions(s, &d, &n)) return false;
+    for (int i = 0; i < n; i++) if (strncmp((const char*)d + i * 22 + 1, label, 16) == 0) return true;
+    return false;
+}
+
+// The game's settings (indexed by the option's preference number, int16 at +18 of an option)
+static volatile int32_t* g_prefs = nullptr;
+
+// Controls > Configuration always Standard (0): Controller Rebind's layouts start from it. Its preference number
+// comes from the option MO_CONFIG; a different value (Classic) is put back at once, and the option cannot be
+// changed in the pause menu (select hook).
+static void LockStandardConfig()
+{
+    static int pref = -1;
+    static DWORD lastSearch = 0;
+    if (!g_prefs || !g_feScreens) return;
+    if (pref < 0)
+    {
+        if (GetTickCount() - lastSearch < 1000) return;
+        lastSearch = GetTickCount();
+        for (int s = 0; s < kFeScreens && pref < 0; s++)
+        {
+            const uint8_t* d; int n;
+            if (!ScreenOptions(s, &d, &n)) continue;
+            for (int i = 0; i < n; i++)
+                if (strncmp((const char*)d + i * 22 + 1, "MO_CONFIG", 16) == 0) { pref = *(const int16_t*)(d + i * 22 + 18); break; }
+        }
+        if (pref < 0) return;
+        if (pref >= 1024 || !IsReadable((const void*)&g_prefs[pref], 4)) { Log("Configuration: preference %d not usable", pref); pref = 1 << 20; return; }
+        Log("Configuration: preference %d, value %d - kept at Standard", pref, g_prefs[pref]);
+    }
+    if (pref >= 1024) return;
+    if (g_prefs[pref] != 0)
+    {
+        static int logs = 0;
+        if (logs++ < 5) Log("Configuration was %d - set back to Standard", g_prefs[pref]);
+        g_prefs[pref] = 0;
+    }
+}
+
+// A page without options (only the end mark, action 46): the game's controller picture
+static bool ScreenEmpty(int s)
+{
+    const uint8_t* d; int n;
+    if (!ScreenOptions(s, &d, &n)) return false;
+    return n == 0 || d[0] == 46;
+}
+
 struct NVec3 { float x, y, z; };
 struct NVec4 { float x, y, z, w; };
 struct NativeCtx
@@ -398,11 +450,8 @@ namespace H
 struct PadState { DWORD packet; WORD buttons; BYTE leftTrigger, rightTrigger; SHORT lx, ly, rx, ry; };
 typedef DWORD (WINAPI* XInputGetStateFn)(DWORD, PadState*);
 
-// The function the game calls next (XInput, or Manual Shift's filter that sits right on XInput)
+// The function the game calls next (XInput)
 static XInputGetStateFn volatile g_next = nullptr;
-// Manual Shift (from the version that works with Controller Rebind) asks for this and puts its filter in there,
-// so it sees the real buttons and takes its shift buttons away before they are remapped here.
-extern "C" __declspec(dllexport) void* __cdecl ControllerRebind_NextSlot() { return (void*)&g_next; }
 
 static volatile bool  g_inVehicle = false;   // player is in a vehicle: vehicle layout
 static volatile bool  g_frontend = true;     // game paused or in its menus: normal layout
@@ -433,6 +482,12 @@ static void Remap(PadState* st, int prof)
     st->rightTrigger = rt;
 }
 
+// The real buttons as the game's own read got them (before remapping): the mod needs no XInput reads of its own
+static volatile WORD  g_rawButtons = 0;
+static volatile BYTE  g_rawLT = 0, g_rawRT = 0;
+static volatile DWORD g_rawTick = 0;
+static volatile DWORD g_rawIndex = 0;
+
 static DWORD WINAPI RebindGetState(DWORD index, PadState* st)
 {
     XInputGetStateFn next = g_next;
@@ -440,6 +495,15 @@ static DWORD WINAPI RebindGetState(DWORD index, PadState* st)
     DWORD r = next(index, st);
     if (r != ERROR_SUCCESS || !st) return r;
     InterlockedIncrement(&g_gameReads);
+    {
+        const DWORD now = GetTickCount();
+        if (index == g_rawIndex || now - g_rawTick > 200)   // the first connected controller
+        {
+            g_rawIndex = index;
+            g_rawButtons = st->buttons; g_rawLT = st->leftTrigger; g_rawRT = st->rightTrigger;
+            g_rawTick = now;
+        }
+    }
     if (GetTickCount() - g_stateTick > 300) return r;   // the mod is not running right now (loading): unchanged
     if (g_blockAll)
     {
@@ -470,23 +534,22 @@ static void FindPadSlot()
     Log("Controller: game variable at %p", (void*)slot);
 }
 
-static const char* ModuleBaseName(const void* addr, HMODULE* out = nullptr)
+static const char* ModuleBaseName(const void* addr)
 {
     static char path[MAX_PATH];
     HMODULE mod = nullptr;
     path[0] = 0;
     if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)addr, &mod) || !mod)
         return "unknown";
-    if (out) *out = mod;
     GetModuleFileNameA(mod, path, MAX_PATH);
     const char* s = strrchr(path, '\\');
     return s ? s + 1 : path;
 }
 
 // Every frame: the game fills the variable when it starts its input, possibly after the mod was loaded.
-// Controller Rebind goes right on XInput, or on a Manual Shift that knows it (that one then moves below it).
-// An older Manual Shift puts its filter in front of whatever is there each frame: two such filters on top of
-// each other would call each other for ever, so Controller Rebind never goes on top of that one.
+// Controller Rebind only goes right on XInput. Another filter that is already there (e.g. a Manual Shift from
+// before 08.11.2026, which puts its filter in front of whatever is there each frame) would call it back for ever,
+// so Controller Rebind never goes on top of one.
 static void UpdatePadHook()
 {
     if (!g_gameGetStateSlot) return;
@@ -499,11 +562,8 @@ static void UpdatePadHook()
         if (cur != reported) { reported = cur; Log("Controller: %s is in front of Controller Rebind", ModuleBaseName((void*)cur)); }
         return;
     }
-    HMODULE mod = nullptr;
-    const char* name = ModuleBaseName((void*)cur, &mod);
-    const bool xinput = _strnicmp(name, "xinput", 6) == 0;
-    const bool newManualShift = mod && GetProcAddress(mod, "ManualShift_ReloadController");
-    if (!xinput && !newManualShift)
+    const char* name = ModuleBaseName((void*)cur);
+    if (_strnicmp(name, "xinput", 6) != 0)
     {
         if (cur != reported)
         {
@@ -519,13 +579,25 @@ static void UpdatePadHook()
 }
 
 // ---------------------------------------------------------------------
-//  The real controller, read directly (for the menu)
+//  The real controller buttons (key bindings, the menu's live light, accept in the pause menu). Taken from the game's
+//  own reads; only while the menu is open and the game does not read the controller does the mod read it itself.
 // ---------------------------------------------------------------------
 static WORD  g_phys = 0;        // pressed buttons, bit = button index (triggers from the usual threshold)
-static bool  g_padConnected = false;
 
-static void PollPad()
+static WORD PhysFrom(WORD buttons, BYTE lt, BYTE rt)
 {
+    WORD phys = 0;
+    for (int i = 0; i < kNumBtn; i++) if (kBtnBit[i] && (buttons & kBtnBit[i])) phys |= 1 << i;
+    if (lt > kTriggerPressed) phys |= 1 << kBtnLT;
+    if (rt > kTriggerPressed) phys |= 1 << kBtnRT;
+    return phys;
+}
+
+static void PollPad(bool menuOpen)
+{
+    if (GetTickCount() - g_rawTick < 200) { g_phys = PhysFrom(g_rawButtons, g_rawLT, g_rawRT); return; }
+    g_phys = 0;
+    if (!menuOpen) return;
     static XInputGetStateFn getState = nullptr;
     static bool tried = false;
     static int slot = -1;
@@ -542,8 +614,6 @@ static void PollPad()
         }
         if (!getState) Log("No XInput found - the menu works with the keyboard only");
     }
-    g_phys = 0;
-    g_padConnected = false;
     if (!getState) return;
     PadState st;
     if (slot >= 0 && getState((DWORD)slot, &st) != ERROR_SUCCESS) slot = -1;
@@ -556,10 +626,7 @@ static void PollPad()
             if (getState((DWORD)i, &st) == ERROR_SUCCESS) slot = i;
         if (slot < 0) return;
     }
-    g_padConnected = true;
-    for (int i = 0; i < kNumBtn; i++) if (kBtnBit[i] && (st.buttons & kBtnBit[i])) g_phys |= 1 << i;
-    if (st.leftTrigger > kTriggerPressed) g_phys |= 1 << kBtnLT;
-    if (st.rightTrigger > kTriggerPressed) g_phys |= 1 << kBtnRT;
+    g_phys = PhysFrom(st.buttons, st.leftTrigger, st.rightTrigger);
 }
 
 static bool KeyDown(int vk) { return vk > 0 && (GetAsyncKeyState(vk) & 0x8000) != 0; }
@@ -572,57 +639,39 @@ static bool GameHasFocus()
 }
 
 // ---------------------------------------------------------------------
-//  Manual Shift's shift buttons (page 3 of the menu, only with a Manual Shift that can reload them)
-// ---------------------------------------------------------------------
-typedef void (__cdecl* MsReloadFn)();
-static MsReloadFn g_msReload = nullptr;
-static bool g_msFound = false;   // ManualShift.asi is loaded (with or without g_msReload)
-static std::string g_msIni;
-static volatile int g_msUp = 0, g_msDown = 1;   // button index, kOff = none
-static bool g_msChanged = false;
-
-static void FindManualShift()
-{
-    HMODULE ms = GetModuleHandleA("ManualShift.asi");
-    g_msFound = ms != nullptr;
-    if (!ms) return;
-    g_msReload = (MsReloadFn)GetProcAddress(ms, "ManualShift_ReloadController");
-    if (!g_msReload) { Log("Manual Shift found, but it is too old to change its buttons here"); return; }
-    char path[MAX_PATH];
-    GetModuleFileNameA(ms, path, MAX_PATH);
-    g_msIni = path;
-    g_msIni = g_msIni.substr(0, g_msIni.find_last_of("\\/") + 1) + "ManualShift.ini";
-    char buf[32];
-    const bool swap = GetPrivateProfileIntA("Controller", "SwapShift", 0, g_msIni.c_str()) != 0;
-    GetPrivateProfileStringA("Controller", "ShiftUp", swap ? "B" : "A", buf, sizeof(buf), g_msIni.c_str());
-    int b = ParseBtn(buf); g_msUp = (b == -2 || b == kBtnLT || b == kBtnRT) ? (swap ? 1 : 0) : b;
-    GetPrivateProfileStringA("Controller", "ShiftDown", swap ? "A" : "B", buf, sizeof(buf), g_msIni.c_str());
-    b = ParseBtn(buf); g_msDown = (b == -2 || b == kBtnLT || b == kBtnRT) ? (swap ? 0 : 1) : b;
-    Log("Manual Shift found: shift up %s, shift down %s", g_msUp < 0 ? "None" : kBtnName[g_msUp], g_msDown < 0 ? "None" : kBtnName[g_msDown]);
-}
-
-static void SaveManualShift()
-{
-    if (!g_msReload || !g_msChanged) return;
-    g_msChanged = false;
-    WritePrivateProfileStringA("Controller", "ShiftUp", g_msUp < 0 ? "None" : kBtnName[g_msUp], g_msIni.c_str());
-    WritePrivateProfileStringA("Controller", "ShiftDown", g_msDown < 0 ? "None" : kBtnName[g_msDown], g_msIni.c_str());
-    g_msReload();
-    Log("Manual Shift buttons saved: up %s, down %s", g_msUp < 0 ? "None" : kBtnName[g_msUp], g_msDown < 0 ? "None" : kBtnName[g_msDown]);
-}
-
-// ---------------------------------------------------------------------
 //  Menu (state in the game thread, drawn in the render thread)
 // ---------------------------------------------------------------------
 static volatile bool g_menuOpen = false;
-static volatile int  g_tab = 0, g_row = 0;   // pages: 0 = on foot, 1 = combat, 2 = in a vehicle, 3 = Manual Shift
+static volatile int  g_tab = 0, g_row = 0;   // pages: 0 = on foot, 1 = combat, 2 = in a vehicle
 static volatile WORD g_menuPhys = 0;         // pressed buttons for the menu's live light
 static volatile DWORD g_menuTick = 0;
+static volatile int  g_fromPause = -1;       // opened from the pause menu: its page (Controller Configuration), else -1
+static volatile int  g_escBack = -1;         // after closing: Esc takes the pause menu back from this page
+static volatile bool g_fromPicture = false;  // opened over the game's controller picture (it did not go back)
 static bool g_mapsChanged = false;
 static void ReadGameLanguage();               // the menu's language (with the font, further down)
 static volatile bool g_picker = false;       // the window with all actions as tiles is open (for g_row)
 static volatile int g_style = 0;             // look of the menu's controller: 0 = Xbox, 1 = PlayStation
-static volatile bool g_styleChanged = false;
+
+// The game's Controls > Gamepad Icons (FusionFix, GTAIV.EFLC.FusionFix.cfg [MISC] Buttons): 0 Xbox 360, 1 Xbox One,
+// 2 PlayStation 3, 3 PlayStation 4, 4 PlayStation 5, 5 Nintendo Switch, 6 Steam Deck, 7 Steam Controller.
+// PlayStation icons: the PlayStation picture; all others: the Xbox picture (no own pictures for them yet).
+static void ReadGamepadIcons()
+{
+    char path[MAX_PATH] = {};
+    HMODULE ff = GetModuleHandleA("GTAIV.EFLC.FusionFix.asi");
+    std::string cfgPath;
+    if (ff && GetModuleFileNameA(ff, path, MAX_PATH))
+    {
+        cfgPath = path;
+        cfgPath = cfgPath.substr(0, cfgPath.find_last_of("\\/") + 1) + "GTAIV.EFLC.FusionFix.cfg";
+    }
+    const int v = cfgPath.empty() ? 0 : (int)GetPrivateProfileIntA("MISC", "Buttons", 0, cfgPath.c_str());
+    const int style = (v >= 2 && v <= 4) ? 1 : 0;
+    static int lastV = -100;
+    if (v != lastV) { lastV = v; Log("Gamepad Icons %d: %s picture", v, style ? "PlayStation" : "Xbox"); }
+    g_style = style;
+}
 
 enum { kTabFoot = 0, kTabCombat = 1, kTabVehicle = 2 };
 static int TabCount() { return 3; }
@@ -683,34 +732,32 @@ static bool RowChanged(int tab, int row)
 // What the layout was when the menu was opened: closing without saving puts it back
 static signed char g_openMap[2][kNumBtn];
 static int g_openKeys[2][kNumBtn];
-static int g_openStyle = 0;
 
 static void RememberOpenState()
 {
     for (int pr = 0; pr < 2; pr++)
         for (int i = 0; i < kNumBtn; i++) { g_openMap[pr][i] = g_map[pr][i]; g_openKeys[pr][i] = g_keyBind[pr][i]; }
-    g_openStyle = g_style;
 }
 
-// save = SAVE AND CLOSE. Page Up / Esc close without saving: every change made since opening is undone.
+// save = SAVE AND CLOSE. Esc closes without saving: every change made since opening is undone.
 static void CloseMenu(bool save)
 {
     g_menuOpen = false;
+    g_escBack = g_fromPicture ? g_fromPause : -1;   // still on the game's controller picture: Esc goes back after closing
+    g_fromPause = -1;
+    g_fromPicture = false;
     if (save)
     {
         if (g_mapsChanged) SaveMaps();
-        if (g_styleChanged) WritePrivateProfileStringA("Menu", "Style", g_style ? "PlayStation" : "Xbox", IniPath().c_str());
         Log("Menu closed - saved");
     }
     else
     {
         for (int pr = 0; pr < 2; pr++)
             for (int i = 0; i < kNumBtn; i++) { g_map[pr][i] = g_openMap[pr][i]; g_keyBind[pr][i] = g_openKeys[pr][i]; }
-        g_style = g_openStyle;
-        Log((g_mapsChanged || g_styleChanged) ? "Menu closed without saving - changes undone" : "Menu closed");
+        Log(g_mapsChanged ? "Menu closed without saving - changes undone" : "Menu closed");
     }
     g_mapsChanged = false;
-    g_styleChanged = false;
 }
 // ---------------------------------------------------------------------
 //  Mouse and keyboard: the game reads them through DirectInput 8. While the menu is open the game gets nothing from
@@ -722,6 +769,13 @@ static volatile bool g_diBlock = false;      // the game gets no mouse and keybo
 static volatile LONG g_mouseDX = 0, g_mouseDY = 0, g_mouseDZ = 0;   // movement collected for the menu's pointer
 static volatile LONG g_mouseButtons = 0;     // bit 0 left, bit 1 right (as the game would have got them)
 static volatile LONG g_mouseSeen = 0;        // DirectInput mouse reads while blocked
+static volatile DWORD g_mouseTick = 0;       // time of the last one (the pause menu may not read the mouse that way)
+
+// Pointer and mouse buttons from DirectInput, or else from Windows' cursor
+static bool MouseByDI()
+{
+    return g_mouseSeen > 0 && (g_fromPause < 0 || GetTickCount() - g_mouseTick < 300);
+}
 
 typedef HRESULT (__stdcall* DiStateFn)(void* self, DWORD cb, void* data);
 typedef HRESULT (__stdcall* DiDataFn)(void* self, DWORD cb, void* items, DWORD* inOut, DWORD flags);
@@ -730,6 +784,7 @@ static DiStateFn g_origDiState[2] = {};
 static DiDataFn g_origDiData[2] = {};
 
 // 0x12 = mouse, 0x13 = keyboard (DI8DEVTYPE), 0 = something else. Asked once per device.
+// (Gamepads through DirectInput: tested 08.11.2026 - the game does not read them at all, so nothing to do here.)
 static int DiDevType(void* self)
 {
     static void* devs[32];
@@ -761,6 +816,7 @@ static HRESULT __stdcall DiStateHook(void* self, DWORD cb, void* data)
         InterlockedExchangeAdd(&g_mouseDZ, m[2]);
         g_mouseButtons = ((b[0] & 0x80) ? 1 : 0) | ((b[1] & 0x80) ? 2 : 0);
         InterlockedIncrement(&g_mouseSeen);
+        g_mouseTick = GetTickCount();
         memset(data, 0, cb);
     }
     else if (type == 0x13) memset(data, 0, cb);
@@ -790,6 +846,7 @@ static HRESULT __stdcall DiDataHook(void* self, DWORD cb, void* items, DWORD* in
             }
         }
         InterlockedIncrement(&g_mouseSeen);
+        g_mouseTick = GetTickCount();
     }
     *inOut = 0;   // the game gets no events
     return hr;
@@ -839,19 +896,246 @@ static void InstallInputHooks()
     Log("Mouse and keyboard hook: %s", patched[0] || patched[1] ? "active" : "failed");
 }
 
-static volatile bool g_closeRequest = false;   // the menu's close button was clicked (render thread)
+// ---------------------------------------------------------------------
+//  The pause menu does not read mouse and keyboard only through DirectInput: the game and FusionFix also use
+//  GetKeyboardState, GetAsyncKeyState, GetKeyState, GetCursorPos and the window's messages. While the menu is open
+//  (g_diBlock) these give nothing too. Patched in the import tables of GTAIV.exe and FusionFix only, so the mod's own
+//  calls (KeyDown, the pointer) still see the real keys and cursor.
+// ---------------------------------------------------------------------
+static POINT g_frozenCursor = {};
+static WNDPROC g_origWndProc = nullptr;
+static HWND g_gameWnd = nullptr;
 
-static void UpdateMenu(bool focus, bool frontend)
+static SHORT WINAPI HkGetAsyncKeyState(int vk) { return g_diBlock ? 0 : GetAsyncKeyState(vk); }
+static SHORT WINAPI HkGetKeyState(int vk) { return g_diBlock ? 0 : GetKeyState(vk); }
+static BOOL WINAPI HkGetKeyboardState(PBYTE k)
 {
-    PollPad();   // only for the live light of the controller buttons
+    const BOOL r = GetKeyboardState(k);
+    if (r && k && g_diBlock) memset(k, 0, 256);
+    return r;
+}
+static BOOL WINAPI HkGetCursorPos(LPPOINT p)
+{
+    const BOOL r = GetCursorPos(p);
+    if (r && p && g_diBlock) *p = g_frozenCursor;
+    return r;
+}
+
+static LRESULT CALLBACK BlockWndProc(HWND w, UINT m, WPARAM wp, LPARAM lp)
+{
+    if (g_diBlock)
+    {
+        if (m == WM_INPUT) return IsWindowUnicode(w) ? DefWindowProcW(w, m, wp, lp) : DefWindowProcA(w, m, wp, lp);
+        if ((m >= WM_KEYFIRST && m <= WM_KEYLAST) || (m >= WM_MOUSEFIRST && m <= WM_MOUSELAST)) return 0;
+    }
+    return IsWindowUnicode(w) ? CallWindowProcW(g_origWndProc, w, m, wp, lp) : CallWindowProcA(g_origWndProc, w, m, wp, lp);
+}
+
+// Every import table entry of the module that points to real is set to hook
+static int PatchIat(HMODULE mod, void* real, void* hook)
+{
+    if (!mod || !real) return 0;
+    uint8_t* base = (uint8_t*)mod;
+    auto dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    auto nt = (IMAGE_NT_HEADERS32*)(base + dos->e_lfanew);
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return 0;
+    int n = 0;
+    for (auto imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); imp->Name; imp++)
+    {
+        for (auto th = (IMAGE_THUNK_DATA32*)(base + imp->FirstThunk); th->u1.Function; th++)
+        {
+            if ((void*)(uintptr_t)th->u1.Function != real) continue;
+            DWORD old;
+            if (VirtualProtect(&th->u1.Function, 4, PAGE_READWRITE, &old))
+            {
+                th->u1.Function = (DWORD)(uintptr_t)hook;
+                VirtualProtect(&th->u1.Function, 4, old, &old);
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+static void InstallBlockHooks()
+{
+    static bool iatDone = false;
+    if (!iatDone)
+    {
+        iatDone = true;
+        HMODULE u = GetModuleHandleA("user32.dll");
+        HMODULE mods[2] = { GetModuleHandleA(nullptr), GetModuleHandleA("GTAIV.EFLC.FusionFix.asi") };
+        int n = 0;
+        for (HMODULE m : mods)
+        {
+            n += PatchIat(m, (void*)GetProcAddress(u, "GetAsyncKeyState"), (void*)&HkGetAsyncKeyState);
+            n += PatchIat(m, (void*)GetProcAddress(u, "GetKeyState"), (void*)&HkGetKeyState);
+            n += PatchIat(m, (void*)GetProcAddress(u, "GetKeyboardState"), (void*)&HkGetKeyboardState);
+            n += PatchIat(m, (void*)GetProcAddress(u, "GetCursorPos"), (void*)&HkGetCursorPos);
+        }
+        Log("Keys and cursor for the game and FusionFix: %d imports hooked", n);
+    }
+    if (!g_origWndProc && g_ppDevice && *g_ppDevice)
+    {
+        D3DDEVICE_CREATION_PARAMETERS cp = {};
+        if (SUCCEEDED((*g_ppDevice)->GetCreationParameters(&cp)) && cp.hFocusWindow)
+        {
+            g_gameWnd = cp.hFocusWindow;
+            g_origWndProc = IsWindowUnicode(g_gameWnd)
+                ? (WNDPROC)SetWindowLongPtrW(g_gameWnd, GWLP_WNDPROC, (LONG_PTR)&BlockWndProc)
+                : (WNDPROC)SetWindowLongPtrA(g_gameWnd, GWLP_WNDPROC, (LONG_PTR)&BlockWndProc);
+            Log("Window messages: %s", g_origWndProc ? "hooked" : "hook failed");
+            if (!g_origWndProc) g_origWndProc = (WNDPROC)1;   // do not try again
+        }
+    }
+}
+
+static volatile bool g_closeRequest = false;   // the menu's close button was clicked (render thread)
+static void SendKey(int vk, bool down);
+
+// ---------------------------------------------------------------------
+//  Pause menu: choosing Controller Configuration opens this menu; the game never goes to its controller picture.
+//  The game's function that carries out a chosen option (found like FusionFix: SelectOption(menu, row, adjusted))
+//  is hooked; for the row MO_CTRLMAP it is not called.
+// ---------------------------------------------------------------------
+typedef uint8_t (__cdecl* SelectFn)(int32_t, int32_t, uint8_t);
+static SelectFn g_origSelect = nullptr;
+static volatile bool g_openRequest = false;
+static volatile DWORD g_acceptAt = 0;   // last time Enter, the left mouse button or A / Cross was down
+
+static uint8_t __cdecl SelectHook(int32_t menu, int32_t row, uint8_t adjusted)
+{
+    if (g_menuOpen || g_diBlock) return 0;   // the pause menu under ours does nothing
+    if (g_feScreen && row >= 0)
+    {
+        const uint8_t* d; int n;
+        if (g_prefs && ScreenOptions(*g_feScreen, &d, &n) && row < n && strncmp((const char*)d + row * 22 + 1, "MO_CONFIG", 16) == 0)
+            return 0;   // Configuration stays Standard
+        if (ScreenOptions(*g_feScreen, &d, &n) && row < n && strncmp((const char*)d + row * 22 + 1, "MO_CTRLMAP", 16) == 0)
+        {
+            static int logs = 0;
+            const bool accept = GetTickCount() - g_acceptAt < 500 || KeyDown(VK_RETURN) || KeyDown(VK_LBUTTON) ||
+                                KeyDown(VK_SPACE) || (g_phys & 1);
+            if (logs < 10) { logs++; Log("Pause menu: Controller Configuration chosen (adjusted %d, accept %d)", adjusted, accept ? 1 : 0); }
+            if (accept && !adjusted) { g_openRequest = true; return 0; }
+        }
+    }
+    return g_origSelect(menu, row, adjusted);
+}
+
+// Pause menu row changes (left / right, accept on a setting): ScrollMenu(row, accepted, direction, adjusted*) as
+// FusionFix calls it. The row Configuration (MO_CONFIG) is not passed on, so it never shows Classic.
+typedef uint8_t (__cdecl* ScrollFn)(int32_t, int32_t, int32_t, uint8_t*);
+static ScrollFn g_origScroll = nullptr;
+
+static uint8_t __cdecl ScrollHook(int32_t row, int32_t accepted, int32_t direction, uint8_t* adjusted)
+{
+    if (g_menuOpen || g_diBlock) return 0;   // the pause menu under ours does nothing
+    if (g_prefs && g_feScreen && row >= 0)
+    {
+        const uint8_t* d; int n;
+        if (ScreenOptions(*g_feScreen, &d, &n) && row < n && strncmp((const char*)d + row * 22 + 1, "MO_CONFIG", 16) == 0)
+            return 0;   // Configuration stays Standard
+    }
+    return g_origScroll(row, accepted, direction, adjusted);
+}
+
+// Jump from the game function fn to hook; *orig = the way to the original. The first `len` bytes of fn are moved to
+// a trampoline and must be whole instructions without relative addresses (checked against `start`). A function
+// that already starts with a jump (another mod's hook) is hooked in front of that jump.
+static bool HookFunction(uint8_t* fn, const uint8_t* start, int len, void* hook, void** orig, const char* name)
+{
+    DWORD old;
+    if (fn[0] == 0xE9)
+    {
+        *orig = fn + 5 + *(int32_t*)(fn + 1);
+        if (!VirtualProtect(fn, 5, PAGE_EXECUTE_READWRITE, &old)) return false;
+        *(int32_t*)(fn + 1) = (int32_t)((uint8_t*)hook - (fn + 5));
+        VirtualProtect(fn, 5, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), fn, 5);
+        Log("Pause menu: %s hook active (in front of another hook)", name);
+        return true;
+    }
+    if (memcmp(fn, start, len) != 0) { Log("Pause menu: %s function has an unknown start - not hooked", name); return false; }
+    uint8_t* tramp = (uint8_t*)VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!tramp) return false;
+    memcpy(tramp, fn, len);
+    tramp[len] = 0xE9;
+    *(int32_t*)(tramp + len + 1) = (int32_t)((fn + len) - (tramp + len + 5));
+    if (!VirtualProtect(fn, len, PAGE_EXECUTE_READWRITE, &old)) return false;
+    *orig = tramp;
+    fn[0] = 0xE9;
+    *(int32_t*)(fn + 1) = (int32_t)((uint8_t*)hook - (fn + 5));
+    for (int i = 5; i < len; i++) fn[i] = 0x90;
+    VirtualProtect(fn, len, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), fn, len);
+    Log("Pause menu: %s hook active", name);
+    return true;
+}
+
+static void InstallSelectHook()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    // SelectOption: sub esp,14 / mov eax,[cookie] (8 bytes)
+    uint8_t* p = FindFirst({ "0F B7 3C D5 ? ? ? ? 3B F7" });
+    static const uint8_t kSelStart[4] = { 0x83, 0xEC, 0x14, 0xA1 };
+    if (!p) Log("Pattern 'select option' not found - Controller Configuration shows the game's picture first");
+    else if (p[-0x25] == 0xE9 || memcmp(p - 0x25, kSelStart, 4) == 0)
+    {
+        uint8_t* fn = p - 0x25;
+        uint8_t start[8]; memcpy(start, fn, 8);   // the cookie address in mov eax,[...] is absolute: moved as it is
+        HookFunction(fn, start, 8, (void*)&SelectHook, (void**)&g_origSelect, "select");
+    }
+    else Log("Pause menu: select function has an unknown start - not hooked");
+    // ScrollMenu: push edi / mov edi,[esp+8] / test edi,edi (7 bytes)
+    p = FindFirst({ "0F B7 14 CD ? ? ? ? 8B C2" });
+    static const uint8_t kScrollStart[7] = { 0x57, 0x8B, 0x7C, 0x24, 0x08, 0x85, 0xFF };
+    if (!p) Log("Pattern 'scroll menu' not found - Configuration can still be switched (it goes back to Standard)");
+    else HookFunction(p - 0x15, kScrollStart, 7, (void*)&ScrollHook, (void**)&g_origScroll, "scroll");
+}
+
+// Pause menu: true when the game just went to its controller picture (Controller Configuration on the Controls page).
+// Seen by the page change: from the page with the option MO_CTRLMAP to a page without options.
+static bool ControllerPageOpened(bool frontend)
+{
+    static int last = -1, learned = -1, logs = 0;
+    if (!g_feScreen || !frontend) { last = -1; return false; }
+    const int cur = *g_feScreen;
+    if (cur == last) return false;
+    const int prev = last;
+    last = cur;
+    if (logs < 40) { logs++; Log("Pause menu page %d", cur); }
+    if (!ScreenEmpty(cur)) return false;
+    if (cur == learned) return true;
+    if (prev >= 0 && ScreenHasLabel(prev, "MO_CTRLMAP"))
+    {
+        learned = cur;
+        Log("Pause menu: Controller Configuration is page %d", cur);
+        return true;
+    }
+    return false;
+}
+
+static void UpdateMenu(bool focus, bool frontend, bool openFromPause)
+{
+    PollPad(g_menuOpen);
     const WORD phys = g_phys;
 
-    // Keyboard, only while the game window is in front (read directly, the game does not get it while the menu is open)
-    static bool prevKeys[9] = { true, true, true, true, true, true, true, true, true };   // a key held at start does not count
-    const int keys[9] = { cfg.keyMenu, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_TAB, VK_BACK, VK_DELETE, VK_ESCAPE };
-    bool kNow[9], kHit[9];
-    for (int i = 0; i < 9; i++)
+    // Keyboard, only while the game window is in front (read directly, the game does not get it while the menu is open).
+    // Read only while the menu is open or just closed; otherwise they count as held, so a key that is already down
+    // when the menu opens does not count.
+    enum { kUp, kDown, kLeft, kRight, kTab, kBack, kDel, kEsc, kKeys };
+    static bool prevKeys[kKeys] = { true, true, true, true, true, true, true, true };
+    const int keys[kKeys] = { VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_TAB, VK_BACK, VK_DELETE, VK_ESCAPE };
+    bool kNow[kKeys] = {}, kHit[kKeys] = {};
+    const bool readKeys = g_menuOpen || g_diBlock || openFromPause || g_openRequest;
+    for (int i = 0; i < kKeys; i++)
     {
+        if (!readKeys) { prevKeys[i] = true; continue; }
         const bool down = KeyDown(keys[i]);   // not tied to focus: coming back to the game is no new press
         kNow[i] = focus && down;
         kHit[i] = focus && down && !prevKeys[i];
@@ -859,18 +1143,21 @@ static void UpdateMenu(bool focus, bool frontend)
     }
 
 
-    // Keyboard page: while its window is open, the next key pressed is taken (Esc: cancel). Every key is watched all the
-    // time, so a key that is already held does not count.
+    // KEYBOARD KEY tile: while it waits, the next key pressed is taken (Esc: cancel). All keys are read only then;
+    // in the first frame only their state, so a key that is already held does not count.
     static bool prevAll[256] = {};
+    static bool wasCapturing = false;
     bool captured = false;
     const bool capturing = g_menuOpen && g_picker && g_capture;
-    for (int vk = 0x08; vk < 0xFF; vk++)
+    const bool firstFrame = capturing && !wasCapturing;
+    wasCapturing = capturing;
+    for (int vk = 0x08; capturing && vk < 0xFF; vk++)
     {
         if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU) continue;   // their left / right keys are used instead
         const bool now = focus && KeyDown(vk);
-        const bool hit = now && !prevAll[vk];
+        const bool hit = now && !prevAll[vk] && !firstFrame;
         prevAll[vk] = now;
-        if (capturing && hit && !captured)
+        if (hit && !captured)
         {
             captured = true;
             if (vk != VK_ESCAPE)
@@ -882,12 +1169,40 @@ static void UpdateMenu(bool focus, bool frontend)
             g_capture = false;   // Esc: back to the tiles
         }
     }
-    if (captured) { for (int i = 0; i < 9; i++) kHit[i] = false; for (int i = 1; i < 9; i++) kNow[i] = false; }
+    if (captured) for (int i = 0; i < kKeys; i++) kHit[i] = kNow[i] = false;
 
+    // Controller Configuration chosen: first one Esc takes the game back from its controller picture to the Controls
+    // page (so that page stays under the menu), then the menu opens. Without that page change within 1 s the menu
+    // opens over the picture and the Esc comes after closing.
+    static int pending = 0, picture = -1;   // 1 = Esc held, 2 = waiting for the Controls page
+    static DWORD pendingAt = 0;
+    bool openNow = false;
+    if (frontend && (KeyDown(VK_RETURN) || KeyDown(VK_LBUTTON) || KeyDown(VK_SPACE) || (phys & 1))) g_acceptAt = GetTickCount();
+    if (g_openRequest)
+    {
+        // Controller Configuration chosen, the game stayed on the Controls page (select hook)
+        g_openRequest = false;
+        if (!g_menuOpen && !pending && frontend) { openNow = true; picture = -1; }
+    }
+    else if (openFromPause && !pending && !g_menuOpen)
+    {
+        picture = *g_feScreen;
+        SendKey(VK_ESCAPE, true);
+        pending = 1; pendingAt = GetTickCount();
+    }
+    else if (pending == 1 && GetTickCount() - pendingAt > 80) { SendKey(VK_ESCAPE, false); pending = 2; }
+    else if (pending == 2)
+    {
+        const bool back = !frontend || *g_feScreen != picture;
+        if ((back && !KeyDown(VK_ESCAPE)) || GetTickCount() - pendingAt > 1000) { pending = 0; openNow = frontend; }
+    }
+    if (pending) for (int i = 0; i < kKeys; i++) kHit[i] = false;   // our own Esc is no key press for the menu
+
+    // The menu opens only from the pause menu (Controls > Controller Configuration)
     if (!g_menuOpen)
     {
         g_closeRequest = false;
-        if (!frontend && kHit[0])
+        if (openNow)
         {
             g_menuOpen = true;
             g_picker = false;
@@ -895,13 +1210,17 @@ static void UpdateMenu(bool focus, bool frontend)
             g_tab = g_inVehicle ? kTabVehicle : kTabFoot;
             g_row = 0;
             g_mouseDX = 0; g_mouseDY = 0; g_mouseDZ = 0;
-            if (g_msReload) FindManualShift();   // the INI may have been edited by hand
+            g_fromPause = *g_feScreen;
+            g_fromPicture = *g_feScreen == picture;
+            g_escBack = -1;
             RememberOpenState();
             ReadGameLanguage();
-            Log("Menu opened");
+            ReadGamepadIcons();
+            Log(g_fromPicture ? "Menu opened (over the game's controller picture)" : "Menu opened (Controller Configuration)");
         }
     }
-    else if (frontend) CloseMenu(false);
+    // Leaving that pause menu page (or the pause menu) closes it
+    else if (!frontend || *g_feScreen != g_fromPause) { CloseMenu(false); g_escBack = -1; }
     else
     {
         // Arrow keys with repeat while held
@@ -914,10 +1233,10 @@ static void UpdateMenu(bool focus, bool frontend)
             return false;
         };
         static DWORD s[4] = {}, n[4] = {};
-        const bool up    = repeat(kNow[1], s[0], n[0]);
-        const bool down  = repeat(kNow[2], s[1], n[1]);
-        const bool left  = repeat(kNow[3], s[2], n[2]);
-        const bool right = repeat(kNow[4], s[3], n[3]);
+        const bool up    = repeat(kNow[kUp], s[0], n[0]);
+        const bool down  = repeat(kNow[kDown], s[1], n[1]);
+        const bool left  = repeat(kNow[kLeft], s[2], n[2]);
+        const bool right = repeat(kNow[kRight], s[3], n[3]);
         const int rows = RowCount(g_tab);
         if (rows > 0)
         {
@@ -926,12 +1245,12 @@ static void UpdateMenu(bool focus, bool frontend)
             if (left) ChangeRow(g_tab, g_row, -1);
             if (right) ChangeRow(g_tab, g_row, +1);
         }
-        if (kHit[5]) { g_tab = (g_tab + 1) % TabCount(); if (g_row >= RowCount(g_tab)) g_row = 0; }
-        if (rows > 0 && kHit[6]) ResetRow(g_tab, g_row, false);   // Backspace: this button
-        if (rows > 0 && kHit[7]) ResetRow(g_tab, g_row, true);    // Delete: the whole page
-        if (kHit[8] && g_picker) g_picker = false;   // Esc: first closes the tile window
+        if (kHit[kTab]) { g_tab = (g_tab + 1) % TabCount(); if (g_row >= RowCount(g_tab)) g_row = 0; }
+        if (rows > 0 && kHit[kBack]) ResetRow(g_tab, g_row, false);   // Backspace: this button
+        if (rows > 0 && kHit[kDel]) ResetRow(g_tab, g_row, true);     // Delete: the whole page
+        if (kHit[kEsc] && g_picker) g_picker = false;   // Esc: first closes the tile window
         else if (g_closeRequest) { g_closeRequest = false; g_picker = false; CloseMenu(true); }   // SAVE AND CLOSE
-        else if (kHit[0] || kHit[8]) { g_picker = false; CloseMenu(false); }                     // Page Up / Esc: no saving
+        else if (kHit[kEsc]) { g_picker = false; CloseMenu(false); }                             // Esc: no saving
     }
 
     // While the menu is open, and after it until the keys and buttons that closed it are released, the game gets
@@ -945,16 +1264,38 @@ static void UpdateMenu(bool focus, bool frontend)
     else if (!closedAt) closedAt = GetTickCount();
     const bool tooLong = closedAt && GetTickCount() - closedAt > 1500;
     if (!g_menuOpen && (!phys || tooLong)) waitPad = false;
-    const bool mouseHeld = g_mouseSeen > 0 ? g_mouseButtons != 0 : (focus && (KeyDown(VK_LBUTTON) || KeyDown(VK_RBUTTON)));
-    const bool keysHeld = mouseHeld || kNow[0] || kNow[8];
+    // (only asked in the short time after closing, while waiting for the release)
+    const bool mouseHeld = waitKeys && !g_menuOpen &&
+        (MouseByDI() ? g_mouseButtons != 0 : (focus && (KeyDown(VK_LBUTTON) || KeyDown(VK_RBUTTON))));
+    const bool keysHeld = mouseHeld || kNow[kEsc];
     if (!g_menuOpen && (!keysHeld || tooLong)) waitKeys = false;
     const bool diBlock = g_menuOpen || waitKeys;
+    if (diBlock && !g_diBlock) GetCursorPos(&g_frozenCursor);   // the game's cursor stays here while blocked
     if (diBlock != g_diBlock)
         Log(diBlock ? "Mouse and keyboard: kept from the game" : "Mouse and keyboard: back to the game%s", tooLong ? " (after 1.5 s)" : "");
     g_blockAll = g_menuOpen || waitPad;
     g_diBlock = diBlock;
     g_menuPhys = phys;
     g_menuTick = GetTickCount();
+
+    // Closed after opening from Controller Configuration: once mouse and keyboard are back with the game, one Esc
+    // takes the pause menu back from the game's controller picture to the Controls page
+    static DWORD escDownAt = 0;
+    if (escDownAt)
+    {
+        if (GetTickCount() - escDownAt > 80) { SendKey(VK_ESCAPE, false); escDownAt = 0; g_escBack = -1; }
+    }
+    else if (g_escBack >= 0 && !g_menuOpen && !diBlock)
+    {
+        if (frontend && g_feScreen && *g_feScreen == g_escBack && focus)
+        {
+            SendKey(VK_ESCAPE, true);
+            escDownAt = GetTickCount();
+            if (!escDownAt) escDownAt = 1;
+            Log("Back to the pause menu's Controls page");
+        }
+        else g_escBack = -1;
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -990,9 +1331,15 @@ static void UpdateKeyBinds(bool active)
 // ---------------------------------------------------------------------
 //  Game frame
 // ---------------------------------------------------------------------
+static volatile DWORD g_gameFrameTick = 0;   // last game frame (it stops in the pause menu)
+static volatile LONG g_tickBusy = 0;         // UpdateMenu runs (game frame or render thread, never both)
+
 static void OnGameFrame()
 {
     UpdatePadHook();
+    InstallSelectHook();   // here (game thread, FusionFix is set up by now), not at load
+    InstallBlockHooks();
+    LockStandardConfig();
 
     static int fusionFix = -1;
     if (fusionFix < 0)
@@ -1030,9 +1377,32 @@ static void OnGameFrame()
     InstallInputHooks();
 
     const bool focus = GameHasFocus();
-    UpdateMenu(focus, frontend);
+    g_gameFrameTick = GetTickCount();
+    if (InterlockedExchange(&g_tickBusy, 1) == 0)
+    {
+        UpdateMenu(focus, frontend, ControllerPageOpened(frontend) && !g_menuOpen);
+        g_tickBusy = 0;
+    }
     UpdateKeyBinds(focus && !frontend && !g_menuOpen && !g_blockAll);
     g_stateTick = GetTickCount();
+}
+
+// The game frame does not run while the pause menu is open. Then the render thread (which keeps going) does the
+// menu's part: Controller Configuration, the menu itself and keeping the input from the game.
+static void PauseTick()
+{
+    const DWORD now = GetTickCount();
+    if (!g_frontend || now - g_gameFrameTick < 100) return;   // in game, or the game frame is running
+    static DWORD last = 0;
+    if (now - last < 8) return;
+    last = now;
+    if (InterlockedExchange(&g_tickBusy, 1) != 0) return;
+    static bool logged = false;
+    if (!logged) { logged = true; Log("Pause menu: the game frame stops here - the menu runs in the render thread"); }
+    LockStandardConfig();
+    UpdateMenu(GameHasFocus(), true, ControllerPageOpened(true) && !g_menuOpen);
+    g_tickBusy = 0;
+    g_stateTick = now;
 }
 
 // ---------------------------------------------------------------------
@@ -1126,9 +1496,7 @@ static const char* const kTr[][kLangCount] = {
                                                                                                                                    "Haz clic en un botón del mando o en su texto para elegir qué hace." },
     { "RESET ALL",                  "ALLES ZURÜCKSETZEN",          "TOUT RÉINITIALISER",           "RIPRISTINA TUTTO",             "RESTABLECER TODO" },
     { "RESET PAGE",                 "SEITE ZURÜCKSETZEN",          "RÉINITIALISER LA PAGE",        "RIPRISTINA PAGINA",            "RESTABLECER PÁGINA" },
-    { "%s / ESC: CLOSE WITHOUT SAVING", "%s / ESC: SCHLIESSEN OHNE SPEICHERN", "%s / ÉCHAP : FERMER SANS ENREGISTRER", "%s / ESC: CHIUDI SENZA SALVARE", "%s / ESC: CERRAR SIN GUARDAR" },
-    { "Page Up",                    "Bild auf",                    "Page préc.",                   "Pag su",                       "Re Pág" },
-    { "Page Down",                  "Bild ab",                     "Page suiv.",                   "Pag giù",                      "Av Pág" },
+    { "ESC: CLOSE WITHOUT SAVING",  "ESC: SCHLIESSEN OHNE SPEICHERN", "ÉCHAP : FERMER SANS ENREGISTRER", "ESC: CHIUDI SENZA SALVARE", "ESC: CERRAR SIN GUARDAR" },
     { "SAVE AND CLOSE",             "SPEICHERN UND SCHLIESSEN",    "ENREGISTRER ET FERMER",        "SALVA E CHIUDI",               "GUARDAR Y CERRAR" },
     { "PRESS A KEY ON THE KEYBOARD", "DRÜCKE EINE TASTE AUF DER TASTATUR", "APPUIE SUR UNE TOUCHE DU CLAVIER", "PREMI UN TASTO SULLA TASTIERA", "PULSA UNA TECLA DEL TECLADO" },
     { "NOW: %s",                    "JETZT: %s",                   "ACTUEL : %s",                  "ORA: %s",                      "AHORA: %s" },
@@ -1407,7 +1775,7 @@ static UiInput ReadMouse(float W, float Hh)
     UiInput in = {};
     const DWORD now = GetTickCount();
     const LONG dx = InterlockedExchange(&g_mouseDX, 0), dy = InterlockedExchange(&g_mouseDY, 0), dz = InterlockedExchange(&g_mouseDZ, 0);
-    const bool directInput = g_mouseSeen > 0;
+    const bool directInput = MouseByDI();
     int buttons = directInput ? (int)g_mouseButtons : ((KeyDown(VK_LBUTTON) ? 1 : 0) | (KeyDown(VK_RBUTTON) ? 2 : 0));
     if (g_curX < 0.f || now - lastFrame > 500)
     {
@@ -1747,15 +2115,9 @@ static void DrawMenuContent(IDirect3DDevice9* dev, float W, float Hh)
     // While the tile window is open, everything below it neither lights up nor takes clicks
     const UiInput blocked = { -1e6f, -1e6f, false, false, 0 };
     const bool pickerOpen = g_picker;
-    static bool s_dropOpen = false;              // the Xbox / PlayStation list is open
-    static DWORD s_lastFrame = 0;
-    if (GetTickCount() - s_lastFrame > 500) s_dropOpen = false;   // menu just opened
-    s_lastFrame = GetTickCount();
-    if (pickerOpen) s_dropOpen = false;
-    const bool dropOpen = s_dropOpen;
-    const UiInput in = (pickerOpen || dropOpen) ? blocked : realIn;
+    const UiInput in = pickerOpen ? blocked : realIn;
     const float s = Hh / 1080.f;
-    const float pw = (std::min)(1440.f * s, W - 20.f), ph = 956.f * s;   // the last 26 px: the version in the corner
+    const float pw = (std::min)(1440.f * s, W - 20.f), ph = 930.f * s;
     const float px = floorf((W - pw) * 0.5f), py = floorf((Hh - ph) * 0.5f);
     const D3DCOLOR btnFill = D3DCOLOR_ARGB(255, 34, 34, 34), btnHover = D3DCOLOR_ARGB(255, 56, 56, 56);
     const D3DCOLOR activeFill = D3DCOLOR_ARGB(255, 30, 48, 78), activeHover = D3DCOLOR_ARGB(255, 44, 70, 112);
@@ -1770,23 +2132,7 @@ static void DrawMenuContent(IDirect3DDevice9* dev, float W, float Hh)
     float y = py + 24.f * s;
     MenuText(dev, "CONTROLLER REBIND", lx, y - 6.f * s, 44.f * s, kLabel);
 
-    // Xbox / PlayStation: a drop-down list
-    const float ddW = 300.f * s, ddH = 42.f * s, ddX = rx - ddW, ddY = y;
-    static const char* const kStyle[2] = { "XBOX", "PLAYSTATION" };
-    {
-        const UiInput& din = pickerOpen ? blocked : realIn;
-        const bool hover = Inside(din, ddX, ddY, ddW, ddH);
-        MenuText(dev, Tr("CONTROLLER"), ddX - 16.f * s, ddY + 7.f * s, 26.f * s, kDim, 2);
-        FillRect(dev, ddX, ddY, ddW, ddH, dropOpen ? activeFill : (hover ? btnHover : btnFill));
-        if (dropOpen) FillRect(dev, ddX, ddY + ddH - 3.f * s, ddW, 3.f * s, kAccent);
-        MenuText(dev, kStyle[style], ddX + 18.f * s, ddY + 4.f * s, 28.f * s, kLabel);
-        // small triangle: down when closed, up when open
-        const float ax = ddX + ddW - 26.f * s, ay = ddY + ddH * 0.5f, k = 7.f * s;
-        std::vector<float> tri = dropOpen ? std::vector<float>{ ax - k, ay + k * 0.5f, ax + k, ay + k * 0.5f, ax, ay - k * 0.6f }
-                                          : std::vector<float>{ ax - k, ay - k * 0.5f, ax + k, ay - k * 0.5f, ax, ay + k * 0.6f };
-        DrawFan(dev, tri, kLabel);
-        if (hover && din.click && !dropOpen) s_dropOpen = true;
-    }
+    // The controller picture follows the game's setting Controls > Gamepad Icons (read when the menu opens)
     y += 64.f * s;
 
     // Pages, in the middle like the game's page title
@@ -1925,15 +2271,10 @@ static void DrawMenuContent(IDirect3DDevice9* dev, float W, float Hh)
     }
 
     // ---- Bottom: help and the two buttons ----
-    const float fy = py + ph - 126.f * s;
+    const float fy = py + ph - 100.f * s;
     MenuText(dev, Tr(tab == kTabCombat ? "Combat uses the on-foot layout: changes here change on foot as well."
                                        : "Click a button on the controller or its label to choose what it does."),
              lx, fy - 4.f * s, 24.f * s, kDim);
-    {
-        char ver[16];
-        snprintf(ver, sizeof(ver), "v%s", kVersion);
-        MenuText(dev, ver, px + pw - 12.f * s, py + ph - 28.f * s, 20.f * s, kDim, 2);   // version, in the bottom right corner
-    }
     const float by = fy + 38.f * s, bh = 46.f * s;
     auto btnW = [&](const char* label) { return (std::max)(250.f * s, TextWidth(label, 28.f * s) + 40.f * s); };
     const float bwAll = btnW(Tr("RESET ALL")), bwPage = btnW(Tr("RESET PAGE")), bw = btnW(Tr("SAVE AND CLOSE"));
@@ -1945,14 +2286,8 @@ static void DrawMenuContent(IDirect3DDevice9* dev, float W, float Hh)
         Log("All pages reset to the standard layout");
     }
     if (UiButton(dev, in, Tr("RESET PAGE"), lx + bwAll + 10.f * s, by, bwPage, bh, s, btnFill, btnHover, kLabel, 28.f * s)) ResetRow(tab, 0, true);
-    {
-        // the menu key from the INI, by its name (Page Up / Page Down in the menu's language)
-        const char* key = cfg.keyMenu == VK_PRIOR ? Tr("Page Up") : cfg.keyMenu == VK_NEXT ? Tr("Page Down") : KeyName(cfg.keyMenu);
-        char hint[128];
-        snprintf(hint, sizeof(hint), Tr("%s / ESC: CLOSE WITHOUT SAVING"), key);
-        Upper(up, hint, sizeof(up));
-        MenuText(dev, up, rx - bw - 16.f * s, by + 9.f * s, 22.f * s, kDim, 2);
-    }
+    Upper(up, Tr("ESC: CLOSE WITHOUT SAVING"), sizeof(up));
+    MenuText(dev, up, rx - bw - 16.f * s, by + 9.f * s, 22.f * s, kDim, 2);
     if (UiButton(dev, in, Tr("SAVE AND CLOSE"), rx - bw, by, bw, bh, s, activeFill, activeHover, kLabel, 28.f * s))
         g_closeRequest = true;
 
@@ -1988,10 +2323,9 @@ static void DrawMenuContent(IDirect3DDevice9* dev, float W, float Hh)
     else if (pickerOpen && g_picker)
     {
         const UiInput& pin = realIn;
-        const bool ms = false;
         const int b = g_row;
         int opts[18], n = 0;
-        for (int i = 0; i < kNumBtn; i++) if (!ms || (i != kBtnLT && i != kBtnRT)) opts[n++] = i;
+        for (int i = 0; i < kNumBtn; i++) opts[n++] = i;
         const int kKeyTile = -3;   // KEYBOARD KEY: the button presses a keyboard key
         opts[n++] = kOff;
         opts[n++] = kKeyTile;
@@ -2003,18 +2337,18 @@ static void DrawMenuContent(IDirect3DDevice9* dev, float W, float Hh)
         const float qx = floorf(px + (pw - qw) * 0.5f), qy = floorf(py + (ph - qh) * 0.5f + 30.f * s);
         const int curKey = g_keyBind[TabProfile(tab)][b];
         const int cur = curKey ? kKeyTile : g_map[TabProfile(tab)][b];
-        const int def = ms ? (b == 0 ? 0 : 1) : b;
+        const int def = b;
         bool done = false;
 
         FillRect(dev, px, py, pw, ph, Premul(170, 0, 0, 0));
         FillRect(dev, qx - 2.f, qy - 2.f, qw + 4.f, qh + 4.f, D3DCOLOR_ARGB(255, 90, 90, 90));
         FillRect(dev, qx, qy, qw, qh, D3DCOLOR_ARGB(255, 18, 18, 18));
 
-        // Head: only the page (Manual Shift: which direction)
+        // Head: only the page
         {
             const float mid = qy + headH * 0.5f, ts = 30.f * s;
             static const char* const kPage[3] = { "ON FOOT", "COMBAT", "IN VEHICLE" };
-            MenuText(dev, ms ? (b == 0 ? "MANUAL SHIFT - SHIFT UP" : "MANUAL SHIFT - SHIFT DOWN") : Tr(kPage[tab]), qx + qw - pad, mid - ts * 0.62f, ts, kLabel, 2);
+            MenuText(dev, Tr(kPage[tab]), qx + qw - pad, mid - ts * 0.62f, ts, kLabel, 2);
         }
         // Tiles
         for (int k = 0; k < n; k++)
@@ -2038,7 +2372,7 @@ static void DrawMenuContent(IDirect3DDevice9* dev, float W, float Hh)
                 const float iw = IconWidth(style, v, 34.f * s);
                 DrawBtnIcon(dev, style, v, tx + iw * 0.5f, mid, 34.f * s, false);
                 tx += iw + 14.f * s;
-                Upper(up, ms ? kPadName[style][v] : ActionText(tab, v), sizeof(up));
+                Upper(up, ActionText(tab, v), sizeof(up));
                 MenuText(dev, up, tx, mid - ts * 0.62f, ts, isCur || hover ? D3DCOLOR_ARGB(255, 255, 255, 255) : kDim);
             }
             else if (v == kKeyTile)
@@ -2072,30 +2406,6 @@ static void DrawMenuContent(IDirect3DDevice9* dev, float W, float Hh)
         // A click outside the window or a right click closes it without a change
         if ((pin.click && !Inside(pin, qx, qy, qw, qh)) || pin.rclick) done = true;
         if (done) { g_picker = false; g_capture = false; }
-    }
-
-    // ---- The Xbox / PlayStation list, over everything ----
-    if (dropOpen)
-    {
-        const float itemH = 44.f * s, ly = ddY + ddH + 2.f * s;
-        FillRect(dev, ddX - 2.f, ly - 2.f, ddW + 4.f, 2 * itemH + 4.f, D3DCOLOR_ARGB(255, 90, 90, 90));
-        bool done = false;
-        for (int k = 0; k < 2; k++)
-        {
-            const float iy = ly + k * itemH;
-            const bool hover = Inside(realIn, ddX, iy, ddW, itemH);
-            FillRect(dev, ddX, iy, ddW, itemH, k == style ? D3DCOLOR_ARGB(255, 30, 48, 78) : (hover ? D3DCOLOR_ARGB(255, 50, 50, 50) : D3DCOLOR_ARGB(255, 26, 26, 26)));
-            if (k == style) FillRect(dev, ddX, iy, 4.f * s, itemH, kAccent);
-            MenuText(dev, kStyle[k], ddX + 18.f * s, iy + 5.f * s, 28.f * s, k == style ? D3DCOLOR_ARGB(255, 255, 255, 255) : kLabel);
-            if (hover && realIn.click)
-            {
-                if (g_style != k) { g_style = k; g_styleChanged = true; }
-                done = true;
-            }
-        }
-        // a click anywhere else (also on the box itself) or a right click closes it
-        if ((realIn.click && !Inside(realIn, ddX, ly, ddW, 2 * itemH)) || realIn.rclick) done = true;
-        if (done) s_dropOpen = false;
     }
 
     DrawPointer(dev, realIn.x, realIn.y, s);
@@ -2246,6 +2556,7 @@ static void DrawOwnScene(IDirect3DDevice9* dev)
 
 static HRESULT __stdcall PresentHook(IDirect3DDevice9* dev, const RECT* a, const RECT* b, HWND w, const RGNDATA* r)
 {
+    PauseTick();
     g_lastPresentTick = GetTickCount();
     DrawOwnScene(dev);
     g_inDevPresent = true;
@@ -2257,6 +2568,7 @@ static HRESULT __stdcall PresentHook(IDirect3DDevice9* dev, const RECT* a, const
 
 static HRESULT __stdcall PresentExHook(IDirect3DDevice9* dev, const RECT* a, const RECT* b, HWND w, const RGNDATA* r, DWORD flags)
 {
+    PauseTick();
     g_lastPresentTick = GetTickCount();
     DrawOwnScene(dev);
     g_inDevPresent = true;
@@ -2268,6 +2580,7 @@ static HRESULT __stdcall PresentExHook(IDirect3DDevice9* dev, const RECT* a, con
 
 static HRESULT __stdcall ScPresentHook(IDirect3DSwapChain9* sc, const RECT* a, const RECT* b, HWND w, const RGNDATA* r, DWORD flags)
 {
+    PauseTick();
     g_lastPresentTick = GetTickCount();
     if (!g_inDevPresent)
     {
@@ -2282,6 +2595,8 @@ static HRESULT __stdcall ScPresentHook(IDirect3DSwapChain9* sc, const RECT* a, c
 static HRESULT __stdcall EndSceneHook(IDirect3DDevice9* dev)
 {
     if (!g_inOwnScene)
+        PauseTick();
+    if (!g_inOwnScene && MenuFresh())   // the render target is only asked for while the menu is open
     {
         IDirect3DSurface9* rt = nullptr; IDirect3DSurface9* bb = nullptr;
         bool toBackBuffer = false;
@@ -2392,12 +2707,26 @@ static bool Init()
     p = FindFirst({ "80 3D ? ? ? ? ? 74 4B E8 ? ? ? ? 84 C0" });
     if (p) g_menuActive = *(bool**)(p + 2);
 
+    // Pause menu scrolling: mov eax,[current page]; lea ecx,[eax+eax*2]; movzx edx,word [ecx*8+table+0x14]
+    p = FindFirst({ "0F B7 14 CD ? ? ? ? 8B C2" });
+    if (p && p[-0x15 + 0x0D] == 0xA1)
+    {
+        auto cur = *(int32_t**)(p - 0x15 + 0x0E);
+        auto tab = (const uint8_t*)(*(uintptr_t*)(p - 0x15 + 0x19) - 0x14);
+        if (IsReadable(cur, 4) && IsReadable(tab, kFeScreens * 24)) { g_feScreen = cur; g_feScreens = tab; }
+    }
+    // The game's settings: mov [edx*4+settings],ebx (FusionFix's pattern)
+    p = FindFirst({ "89 1C 95 ? ? ? ? E8 ? ? ? ? A1 ? ? ? ? 83 C4 04 8D 04 40" });
+    if (p && IsReadable(*(int32_t**)(p + 3), 4)) g_prefs = *(int32_t**)(p + 3);
+    if (!g_prefs) Log("Pattern 'settings' not found - Configuration is not kept at Standard");
+    if (g_feScreen) Log("Pause menu pages at %p", (void*)g_feScreen);
+    else Log("Pattern 'pause menu pages' not found - Controller Configuration shows the game's picture");
+
     p = FindFirst({ "83 3D ? ? ? ? ? 74 17 8B 4D 14", "83 3D ? ? ? ? ? 74 15 8B 44 24 1C", "83 3D ? ? ? ? ? 74 EF" });
     if (p) g_ppDevice = *(IDirect3DDevice9***)(p + 2);
     else Log("Pattern 'D3D device' not found - no menu");
 
     FindPadSlot();
-    FindManualShift();
 
     p = FindFirst({ "E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? B9 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? B9" });
     if (!p) { Log("Pattern 'game frame' not found"); return false; }
@@ -2424,7 +2753,6 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         g_log = fopen((g_dir + "ControllerRebind.log").c_str(), "w");
         Log("Controller Rebind %s starting", kVersion);
         LoadConfig();
-        g_style = cfg.style;
         Init();
     }
     else if (reason == DLL_PROCESS_DETACH)
