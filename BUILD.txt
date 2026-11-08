@@ -1,0 +1,48 @@
+Controller Rebind - source code
+===============================
+Target: GTA IV: The Complete Edition 1.2.0.59 + FusionFix (32-bit ASI plugin)
+
+Free controller button layout: every button and both triggers can do what another one does, with one layout in
+vehicles and one on foot. Set up in a menu in game, saved in ControllerRebind.ini.
+
+BUILD (32-bit Windows DLL) with zig:
+  zig c++ -target x86-windows-gnu -std=c++20 -O2 -shared -fno-exceptions ^
+      -o build\ControllerRebind.dll main.cpp -luser32 -lkernel32 -lgdi32
+  Rename ControllerRebind.dll to ControllerRebind.asi.
+
+FILES
+  main.cpp          the whole mod (XInput remap, menu, D3D9 hooks). The menu font is made at run time with Windows'
+                    own font renderer (Bahnschrift).
+  gen/assets.h      the two controller pictures as bytes; gen/pad_layout.h: where the buttons are on them;
+                    gen/pad_hl.h: the outline of every button (small white PNGs, drawn blue when chosen);
+                    gen/icons.h: small button icons (graphics/make_icons.ps1 gen [preview.png])
+  graphics/         make_controllers.ps1 draws pad_xbox.png / pad_ps.png (line art like the game's controller
+                    help) and writes gen/pad_layout.h; embed_pngs.ps1 writes gen/assets.h. Windows PowerShell only:
+                      powershell -ExecutionPolicy Bypass -File graphics\make_controllers.ps1 graphics gen
+                      powershell -ExecutionPolicy Bypass -File graphics\embed_pngs.ps1 graphics gen
+  third/stb/        stb_image.h (public domain PNG decoder)
+
+HOW IT WORKS
+  - The game loads XInput at run time and keeps the address of XInputGetState in a variable (found by the code that
+    stores it). Controller Rebind puts its own function there: it calls XInput and changes the buttons the game
+    gets (button -> other button, trigger <-> button, or off).
+  - Layout: [Vehicle] while the player is in any vehicle (IS_CHAR_IN_ANY_CAR), [OnFoot] otherwise. Paused or in the
+    game's menus (IS_PAUSE_MENU_ACTIVE, pause flags) the game gets the normal buttons.
+  - Menu: F8 ([Menu] Key), used with mouse and keyboard only. While it is open (and afterwards until the keys and
+    buttons that closed it are released) the game gets nothing from the controller, the mouse or the keyboard:
+    IDirectInputDevice8 GetDeviceState / GetDeviceData (vtable 9 / 10 of dinput8.dll's devices, A and W) return
+    an empty mouse and keyboard. The mouse movement taken from the game moves the menu's own drawn pointer (without
+    DirectInput mouse reads: Windows' cursor in the game window). Keys for the menu are read with GetAsyncKeyState.
+    The controller is still read directly through XInput, only for the live light of the pressed buttons.
+  - Manual Shift: its filter belongs right on XInput, below Controller Rebind, so it sees the real buttons.
+    Controller Rebind exports ControllerRebind_NextSlot(): the address of the function it calls next; a Manual Shift
+    that knows this puts its filter there. Controller Rebind only goes on top of XInput itself or of such a Manual
+    Shift (export ManualShift_ReloadController). An older Manual Shift puts its filter in front of whatever is in the
+    variable every frame: then Controller Rebind stays out (log line), as two such filters would call each other.
+    With a Manual Shift that has ManualShift_ReloadController, the menu has a third page for its shift buttons
+    (written to ManualShift.ini [Controller] ShiftUp / ShiftDown, then that function is called).
+  - Drawing: the same ways as Manual Shift's gauge. Vulkan/DLSSIV: at EndScene of the backbuffer frame with a full
+    state block. Real D3D9: right before Present with only the changed states restored (d3d9.cfg decides).
+
+CREDITS
+  FusionFix (ThirteenAG, GPL-3.0): byte patterns and native call method. IV-SDK (Zolika1351): structure layouts.
