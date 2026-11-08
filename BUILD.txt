@@ -28,19 +28,33 @@ HOW IT WORKS
     gets (button -> other button, trigger <-> button, or off).
   - Layout: [Vehicle] while the player is in any vehicle (IS_CHAR_IN_ANY_CAR), [OnFoot] otherwise. Paused or in the
     game's menus (IS_PAUSE_MENU_ACTIVE, pause flags) the game gets the normal buttons.
-  - Menu: F8 ([Menu] Key), used with mouse and keyboard only. While it is open (and afterwards until the keys and
-    buttons that closed it are released) the game gets nothing from the controller, the mouse or the keyboard:
+  - Keyboard keys: a button set to Key:<name> presses that key with SendInput (scan code), so the game and other
+    mods (e.g. Manual Shift's E / R / J) see a real key; the game gets nothing from that button.
+  - Menu: opened only from the pause menu (Controls > Controller Configuration, see below), used with mouse and
+    keyboard only. Esc closes it without saving, SAVE AND CLOSE saves. Pages: on foot, combat (both [OnFoot])
+    and in a vehicle ([Vehicle]). While it is open (and afterwards until the keys and buttons that closed it are
+    released, at most 1.5 s) the game gets nothing from the controller, the mouse or the keyboard:
     IDirectInputDevice8 GetDeviceState / GetDeviceData (vtable 9 / 10 of dinput8.dll's devices, A and W) return
     an empty mouse and keyboard. The mouse movement taken from the game moves the menu's own drawn pointer (without
     DirectInput mouse reads: Windows' cursor in the game window). Keys for the menu are read with GetAsyncKeyState.
     The controller is still read directly through XInput, only for the live light of the pressed buttons.
-  - Manual Shift: its filter belongs right on XInput, below Controller Rebind, so it sees the real buttons.
-    Controller Rebind exports ControllerRebind_NextSlot(): the address of the function it calls next; a Manual Shift
-    that knows this puts its filter there. Controller Rebind only goes on top of XInput itself or of such a Manual
-    Shift (export ManualShift_ReloadController). An older Manual Shift puts its filter in front of whatever is in the
-    variable every frame: then Controller Rebind stays out (log line), as two such filters would call each other.
-    With a Manual Shift that has ManualShift_ReloadController, the menu has a third page for its shift buttons
-    (written to ManualShift.ini [Controller] ShiftUp / ShiftDown, then that function is called).
+  - Pause menu: Controls > Controller Configuration opens this menu instead of the game's controller picture. The
+    current pause menu page and the page table are found like FusionFix does (pattern "0F B7 14 CD ? ? ? ? 8B C2",
+    function start -0x15, page at +0x0E, table at +0x19 minus 0x14; 24 bytes per page, 22 per option). The picture
+    is the page without options that comes after the page with the option MO_CTRLMAP. After closing, one Esc
+    (SendInput) takes the pause menu back to the Controls page. There the pointer follows Windows' cursor when the
+    game does not read the mouse through DirectInput.
+  - Controller picture: follows the game's Controls > Gamepad Icons (FusionFix, GTAIV.EFLC.FusionFix.cfg [MISC]
+    Buttons, read when the menu opens): 2-4 (PlayStation 3/4/5) the PlayStation picture, all others (Xbox 360/One,
+    Switch, Steam Deck, Steam Controller) the Xbox picture.
+  - Controls > Configuration is kept at Standard: the game's settings array (pattern "89 1C 95 ? ? ? ? E8 ? ? ? ? A1
+    ? ? ? ? 83 C4 04 8D 04 40", +3), index = the preference number of the option MO_CONFIG; the select hook ignores
+    that row.
+  - Language ([Menu] Language=Auto): the game's language from GTAIV.EFLC.FusionFix.cfg [LANGUAGEOVERRIDE];
+    English, German, French, Italian and Spanish texts are in main.cpp (kTr).
+  - Other controller filters: Controller Rebind only goes right on XInput. If another mod already put its own filter
+    in the game's variable (e.g. a Manual Shift from before 08.11.2026), it stays out and writes a log line, as two
+    such filters would call each other for ever.
   - Drawing: the same ways as Manual Shift's gauge. Vulkan/DLSSIV: at EndScene of the backbuffer frame with a full
     state block. Real D3D9: right before Present with only the changed states restored (d3d9.cfg decides).
 
