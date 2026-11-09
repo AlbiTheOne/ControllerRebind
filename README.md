@@ -18,8 +18,7 @@ Rebind every controller button and both triggers in GTA IV, with separate layout
 ## Requirements and compatibility
 
 - GTA IV: The Complete Edition **1.2.0.59** with [FusionFix](https://www.nexusmods.com/gta4/mods/716).
-- An **XInput** controller: Xbox, or PlayStation through Steam Input / DS4Windows.
-- Tested setup: FusionFix 5.1.2 with Vulkan. TLAD, TBoGT and native D3D9 are untested.
+- Tested setup: FusionFix 5.1.2 with Vulkan.
 - Older Manual Shift versions that filter controller input may conflict. Use the updated keyboard-based version and map buttons to its keyboard keys.
 
 ## Installation and use
