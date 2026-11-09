@@ -15,11 +15,10 @@ Rebind every controller button and both triggers in GTA IV, with separate layout
 - **Consistent remapping:** controller Configuration is kept at Standard.
 - **Cleaner interface:** removed the separate controller-style selector and on-screen version label.
 
-## Requirements and compatibility
+## Requirements
 
 - GTA IV: The Complete Edition **1.2.0.59** with [FusionFix](https://www.nexusmods.com/gta4/mods/716).
 - Tested setup: FusionFix 5.1.2 with Vulkan.
-- Older Manual Shift versions that filter controller input may conflict. Use the updated keyboard-based version and map buttons to its keyboard keys.
 
 ## Installation and use
 
